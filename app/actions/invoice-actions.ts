@@ -1,24 +1,39 @@
 "use server"
 
 import { PDFDocument, rgb, StandardFonts } from "pdf-lib"
-import { neon } from "@neondatabase/serverless"
+import mysql, { ResultSetHeader } from "mysql2/promise"
 import { revalidatePath } from "next/cache"
 import { initializeDatabase } from "../db/init-db"
 import { formatDate } from "../utils/format-utils"
 import type { InvoiceData } from "../types/invoice-types"
 
-const sql = neon(process.env.DATABASE_URL!)
+// Configure the local MySQL connection
+const pool = mysql.createPool({
+  host: "localhost", // Replace with your database host
+  user: "root", // Replace with your MySQL username
+  password: "", // Replace with your MySQL password
+  database: "invoice_generator", // Replace with your database name
+  port: 3306, // Replace with your MySQL port if different
+})
 
 export async function saveInvoice(data: InvoiceData) {
+  const connection = await pool.getConnection()
   try {
+    console.log("Starting saveInvoice with data:", data)
+
     // Initialize database tables if they don't exist
     const dbInit = await initializeDatabase()
+    console.log("Database initialization result:", dbInit)
     if (!dbInit.success) {
       throw new Error(`Database initialization failed: ${dbInit.message}`)
     }
 
+    // Start a transaction
+    await connection.beginTransaction()
+
     // Insert the invoice
-    const result = await sql`
+    const [result] = await connection.query(
+      `
       INSERT INTO invoices (
         invoice_number, 
         invoice_date, 
@@ -33,28 +48,32 @@ export async function saveInvoice(data: InvoiceData) {
         notes, 
         total_amount
       ) 
-      VALUES (
-        ${data.invoiceNumber}, 
-        ${data.invoiceDate}, 
-        ${data.dueDate}, 
-        ${data.companyName}, 
-        ${data.companyAddress}, 
-        ${data.companyEmail}, 
-        ${data.companyPhone}, 
-        ${data.clientName}, 
-        ${data.clientAddress}, 
-        ${data.clientEmail}, 
-        ${data.notes || ""}, 
-        ${data.totalAmount || 0}
-      ) 
-      RETURNING id
-    `
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        data.invoiceNumber,
+        data.invoiceDate,
+        data.dueDate,
+        data.companyName,
+        data.companyAddress,
+        data.companyEmail,
+        data.companyPhone,
+        data.clientName,
+        data.clientAddress,
+        data.clientEmail,
+        data.notes || "",
+        data.totalAmount || 0,
+      ]
+    )
+    console.log("Invoice inserted, result:", result)
 
-    const invoiceId = result[0].id
+    const invoiceId = (result as ResultSetHeader).insertId
 
     // Insert line items
     for (const item of data.lineItems) {
-      await sql`
+      console.log("Inserting line item:", item)
+      await connection.query(
+        `
         INSERT INTO line_items (
           invoice_id, 
           description, 
@@ -62,24 +81,33 @@ export async function saveInvoice(data: InvoiceData) {
           unit_price, 
           amount
         ) 
-        VALUES (
-          ${invoiceId}, 
-          ${item.description}, 
-          ${item.quantity}, 
-          ${item.unitPrice}, 
-          ${item.quantity * item.unitPrice}
-        )
-      `
+        VALUES (?, ?, ?, ?, ?)
+        `,
+        [
+          invoiceId,
+          item.description,
+          item.quantity,
+          item.unitPrice,
+          item.quantity * item.unitPrice,
+        ]
+      )
     }
+
+    // Commit the transaction
+    await connection.commit()
+    console.log("Transaction committed successfully")
 
     revalidatePath("/")
     return { success: true, invoiceId }
   } catch (error) {
+    // Rollback the transaction in case of an error
+    await connection.rollback()
     console.error("Error saving invoice:", error)
     throw new Error(`Failed to save invoice: ${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    connection.release()
   }
 }
-
 export async function generateInvoice(data: InvoiceData): Promise<Blob> {
   // Create a new PDF document
   const pdfDoc = await PDFDocument.create()
